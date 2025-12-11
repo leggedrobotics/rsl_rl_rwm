@@ -24,8 +24,8 @@ pip install rsl-rl-lib
 or by cloning this repository and installing it with:
 
 ```bash
-git clone https://github.com/leggedrobotics/rsl_rl
-cd rsl_rl
+git clone https://github.com/leggedrobotics/rsl_rl_rwm.git
+cd rsl_rl_rwm
 pip install -e .
 ```
 
