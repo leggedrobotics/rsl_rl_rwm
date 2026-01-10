@@ -25,6 +25,9 @@ class RNNBase(nn.Module):
     
     def reset(self):
         self.memory.reset()
+        
+    def reset_partial(self, batch_indices):
+        self.memory.reset_partial(batch_indices)
 
 
 class Memory(nn.Module):
@@ -42,3 +45,7 @@ class Memory(nn.Module):
     
     def reset(self):
         self.hidden_states = None
+
+    def reset_partial(self, batch_indices):
+        if self.hidden_states is not None:
+            self.hidden_states[:, batch_indices] = 0.0

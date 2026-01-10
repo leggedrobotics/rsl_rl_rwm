@@ -31,6 +31,9 @@ class MLPBase(nn.Module):
     def reset(self):
         pass
 
+    def reset_partial(self, batch_indices):
+        pass
+
 
 class MLPStateHead(nn.Module):
     def __init__(
@@ -94,6 +97,9 @@ class MLPStateHead(nn.Module):
         return state_mean, torch.exp(state_logstd)
 
     def reset(self):
+        pass
+    
+    def reset_partial(self, batch_indices):
         pass
 
 
@@ -169,4 +175,7 @@ class MLPAuxiliaryHead(nn.Module):
         return extension_pred, contact_logits, termination_logits
 
     def reset(self):
+        pass
+
+    def reset_partial(self, batch_indices):
         pass

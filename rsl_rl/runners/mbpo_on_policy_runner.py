@@ -66,12 +66,21 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             print(f"Synchronizing parameters for rank {self.gpu_global_rank}...")
             self.alg.broadcast_parameters()
 
+        # imagination
+        if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
+            self.env.unwrapped.prepare_imagination()
+
+            self.imagination_infos = []
+            self.imagination_rewbuffer = deque(maxlen=100)
+            self.imagination_lenbuffer = deque(maxlen=100)
+            self.imagination_cur_reward_sum = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
+            self.imagination_cur_episode_length = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
+
         # Start training
         start_iter = self.current_learning_iteration
         tot_iter = start_iter + num_learning_iterations
         for it in range(start_iter, tot_iter):
             start = time.time()
-            rewards_collection = torch.zeros(self.env.num_envs, self.num_steps_per_env, device=self.device)
             # Rollout
             with torch.inference_mode():
                 for i in range(self.num_steps_per_env):
@@ -110,7 +119,6 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
                         lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
                         cur_reward_sum[new_ids] = 0
                         cur_episode_length[new_ids] = 0
-                        rewards_collection[:, i] = rewards / self.env.unwrapped.step_dt
                         # -- intrinsic and extrinsic rewards
                         if self.alg.rnd:
                             erewbuffer.extend(cur_ereward_sum[new_ids][:, 0].cpu().numpy().tolist())
@@ -129,7 +137,9 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             # update policy
             if it >= start_iter + self.cfg["system_dynamics_warmup_iterations"]:
                 if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
-                    real_observation, imagination_observation, per_step_reward_imagination, num_valid_imagination_envs, epistemic_uncertainty, rewbuffer_imagination, lenbuffer_imagination = self.imagine()
+                    if it == start_iter + self.cfg["system_dynamics_warmup_iterations"]:
+                        self.state_history, self.action_history = self.alg.prepare_imagination()
+                    real_observation, imagination_observation, num_valid_imagination_envs, epistemic_uncertainty, infos_imagination, rewbuffer_imagination, lenbuffer_imagination, collection_time_imagination = self.imagine()
                     loss_dict = self.alg.update(imagination=True)
                 else:
                     loss_dict = self.alg.update()
@@ -158,6 +168,7 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
 
             # Clear episode infos
             ep_infos.clear()
+            self.imagination_infos.clear()
             # Save code state
             if it == start_iter and not self.disable_logs:
                 # obtain all the diff files
@@ -172,62 +183,82 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
             self.save(os.path.join(self.log_dir, f"model_{self.current_learning_iteration + 1}.pt"))
 
     def imagine(self):
-        rewbuffer = deque(maxlen=100)
-        lenbuffer = deque(maxlen=100)
-        cur_reward_sum = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
-        cur_episode_length = torch.zeros(self.num_imagination_envs, dtype=torch.float, device=self.device)
+        start = time.time()
         epistemic_uncertainty = torch.zeros(self.num_imagination_steps, device=self.device)
-        state_history, action_history = self.alg.prepare_imagination()
-        self.env.unwrapped.prepare_imagination()
+        self.alg.system_dynamics.reset()
         with torch.inference_mode():
             for i in range(self.num_imagination_steps):
-                if i % self.imagination_cfg["command_resample_interval"] == 0:
-                    self.env.unwrapped.sample_imagination_command()
-                if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and i > 0:
-                    state_history = state_history[:, -1:]
-                    action_history = action_history[:, -1:]
-                imagination_obs = self.env.unwrapped.get_imagination_observation(state_history, action_history)
+                if self.alg.system_dynamics.architecture_config["type"] in ["rnn", "rssm"] and self.env.unwrapped.common_step_counter > 0:
+                    self.state_history = self.state_history[:, -1:]
+                    self.action_history = self.action_history[:, -1:]
+                imagination_obs = self.env.unwrapped.get_imagination_observation(self.state_history, self.action_history)
                 imagination_actions = self.alg.act(imagination_obs)
-                imagination_obs, imagination_rewards, imagination_dones, imagination_extras, state_history, action_history, uncertainty = self.env.unwrapped.imagination_step(imagination_actions, state_history, action_history)
+                imagination_obs, imagination_rewards, imagination_dones, imagination_extras, self.state_history, self.action_history, uncertainty = self.env.unwrapped.imagination_step(imagination_actions, self.state_history, self.action_history)
+                reset_env_ids = imagination_dones.nonzero(as_tuple=False).squeeze(-1)
+                if len(reset_env_ids) > 0:
+                    imagination_generator = self.alg.system_replay_buffer.mini_batch_generator(self.alg.system_dynamics.history_horizon, 1, len(reset_env_ids))
+                    imagination_state_history, imagination_action_history = next(imagination_generator)[:2]
+                    self.state_history[reset_env_ids] = imagination_state_history[:, -self.state_history.shape[1]:]
+                    self.action_history[reset_env_ids] = imagination_action_history[:, -self.action_history.shape[1]:]
                 self.alg.process_env_step(imagination_obs, imagination_rewards, imagination_dones, imagination_extras, imagination=True)
                 epistemic_uncertainty[i] = uncertainty.mean(dim=0)
                 
-                cur_reward_sum += imagination_rewards
-                cur_episode_length += 1
-                new_ids = (imagination_dones > 0).nonzero(as_tuple=False)
-                rewbuffer.extend(cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
-                lenbuffer.extend(cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
-                cur_reward_sum[new_ids] = 0
-                cur_episode_length[new_ids] = 0
-                
+                if self.log_dir is not None:
+                    if "episode" in imagination_extras:
+                        self.imagination_infos.append(imagination_extras["episode"])
+                    elif "log" in imagination_extras:
+                        self.imagination_infos.append(imagination_extras["log"])
+                    self.imagination_cur_reward_sum += imagination_rewards
+                    self.imagination_cur_episode_length += 1
+                    new_ids = (imagination_dones > 0).nonzero(as_tuple=False)
+                    self.imagination_rewbuffer.extend(self.imagination_cur_reward_sum[new_ids][:, 0].cpu().numpy().tolist())
+                    self.imagination_lenbuffer.extend(self.imagination_cur_episode_length[new_ids][:, 0].cpu().numpy().tolist())
+                    self.imagination_cur_reward_sum[new_ids] = 0
+                    self.imagination_cur_episode_length[new_ids] = 0
+            
+            stop = time.time()
+            imagination_collection_time = stop - start
+    
             self.alg.compute_returns(imagination_obs, imagination=True)
             
         # logs
         real_observation = self.alg.storage.observations["policy"]
         imagination_observation = torch.cat([self.alg.imagination_storage.observations["policy"], imagination_obs["policy"].unsqueeze(0)], dim=0)
-        per_step_reward_imagination = self.env.unwrapped.get_imagination_reward_per_step()
         num_valid_imagination_envs = self.alg.imagination_storage.valid_env_mask.sum()
         epistemic_uncertainty = epistemic_uncertainty.mean(dim=0)
-        return real_observation, imagination_observation, per_step_reward_imagination, num_valid_imagination_envs, epistemic_uncertainty, rewbuffer, lenbuffer
+        return real_observation, imagination_observation, num_valid_imagination_envs, epistemic_uncertainty, self.imagination_infos, self.imagination_rewbuffer, self.imagination_lenbuffer, imagination_collection_time
 
     def log(self, locs: dict, width: int = 80, pad: int = 35):
         super().log(locs, width, pad)
-        self.writer.add_scalar("Model Based/per_step_reward_sum_real", locs["rewards_collection"].mean(), locs["it"])
 
         if locs["it"] >= locs["start_iter"] + self.cfg["system_dynamics_warmup_iterations"]:        
             if self.num_imagination_envs > 0 and self.num_imagination_steps > 0:
+                # -- Imagination info
+                if locs["infos_imagination"]:
+                    for key in locs["infos_imagination"][0]:
+                        infotensor = torch.tensor([], device=self.device)
+                        for ep_info in locs["infos_imagination"]:
+                            # handle scalar and zero dimensional tensor infos
+                            if key not in ep_info:
+                                continue
+                            if not isinstance(ep_info[key], torch.Tensor):
+                                ep_info[key] = torch.Tensor([ep_info[key]])
+                            if len(ep_info[key].shape) == 0:
+                                ep_info[key] = ep_info[key].unsqueeze(0)
+                            infotensor = torch.cat((infotensor, ep_info[key].to(self.device)))
+                        value = torch.mean(infotensor)
+                        # log to logger and terminal
+                        self.writer.add_scalar("Imagination/" + key, value, locs["it"])
+
                 self.writer.add_scalar("Model Based/epistemic_uncertainty", locs["epistemic_uncertainty"], locs["it"])
-                per_step_reward_sum_imagination = torch.stack(list(locs["per_step_reward_imagination"].values())).sum()
                 self.writer.add_scalar("Model Based/num_valid_imagination_envs", locs["num_valid_imagination_envs"], locs["it"])
+                self.writer.add_scalar("Perf/imagination collection time", locs["collection_time_imagination"], locs["it"])
                 self.real_obs_buf = torch.cat((self.real_obs_buf, locs["real_observation"].flatten(0, 1)), dim=0)[-self.cfg["pca_obs_buf_size"]:]
                 self.imagination_obs_init_buf = torch.cat((self.imagination_obs_init_buf, locs["imagination_observation"][0]), dim=0)[-self.cfg["pca_obs_buf_size"]:]
                 self.imagination_obs_advance_buf = torch.cat((self.imagination_obs_advance_buf, locs["imagination_observation"][1:].flatten(0, 1)), dim=0)[-self.cfg["pca_obs_buf_size"]:]
-                self.writer.add_scalar("Model Based/per_step_reward_sum_imagination", per_step_reward_sum_imagination, locs["it"])
                 if len(locs["rewbuffer_imagination"]) > 0:
                     self.writer.add_scalar("Train/mean_reward_imagination", statistics.mean(locs["rewbuffer_imagination"]), locs["it"])
                     self.writer.add_scalar("Train/mean_episode_length_imagination", statistics.mean(locs["lenbuffer_imagination"]), locs["it"])
-                for term, value in locs["per_step_reward_imagination"].items():
-                    self.writer.add_scalar(f"Model Based/per_step_reward_imagination/{term}", value, locs["it"])
                 if locs["it"] % self.save_interval == 0:
                     self.plotter.plot_pca(
                         self.ax0,
@@ -404,9 +435,13 @@ class MBPOOnPolicyRunner(OnPolicyRunner):
         alg: MBPOPPO = alg_class(actor_critic, system_dynamics, self.state_normalizer, self.action_normalizer, device=self.device, **self.alg_cfg, multi_gpu_cfg=self.multi_gpu_cfg)
 
         self.num_imagination_envs = self.imagination_cfg["num_envs"]
-        self.num_imagination_steps = self.imagination_cfg["num_steps"]
+        self.num_imagination_steps = self.imagination_cfg["num_steps_per_env"]
+        self.max_imagination_episode_length = self.imagination_cfg["max_episode_length"]
+        self.imagination_command_resample_interval_range = self.imagination_cfg["command_resample_interval_range"]
         self.env.unwrapped.num_imagination_envs = self.num_imagination_envs
         self.env.unwrapped.num_imagination_steps = self.num_imagination_steps
+        self.env.unwrapped.max_imagination_episode_length = self.max_imagination_episode_length
+        self.env.unwrapped.imagination_command_resample_interval_range = self.imagination_command_resample_interval_range
         self.env.unwrapped.imagination_state_normalizer = self.state_normalizer
         self.env.unwrapped.imagination_action_normalizer = self.action_normalizer
         self.env.unwrapped.system_dynamics = alg.system_dynamics

@@ -331,6 +331,15 @@ class SystemDynamicsEnsemble(nn.Module):
             for head in self.auxiliary_heads:
                 head.reset()
 
+    def reset_partial(self, batch_indices):
+        self.state_base.reset_partial(batch_indices)
+        for head in self.state_heads:
+            head.reset_partial(batch_indices)
+        if self.auxiliary_base is not None:
+            self.auxiliary_base.reset_partial(batch_indices)
+            for head in self.auxiliary_heads:
+                head.reset_partial(batch_indices)
+
     def train(self, mode=True):
         super().train(mode)
         if self.freeze_auxiliary:
